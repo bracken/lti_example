@@ -1,0 +1,17 @@
+<html>
+  <head><title>LTI Parameters</title></head>
+  <body>
+    <h1>LTI-related parameters</h1>
+  <table>
+    <% 
+       params = @tool_provider.to_params
+       params.keys.sort.each do |key| 
+    %>
+      <tr>
+        <td><%= key %></td>
+        <td><%= params[key] %></td>
+      </tr>
+    <% end %>
+  </table>
+  </body>
+</html>

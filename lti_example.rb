@@ -1,21 +1,5 @@
-begin
-  require 'rubygems'
-rescue LoadError
-  puts "You must install rubygems to run this example"
-  raise
-end
-
-begin
-  require 'bundler/setup'
-rescue LoadError
-  puts "to set up this example, run these commands:"
-  puts "  gem install bundler"
-  puts "  bundle install"
-  raise
-end
-
 require 'sinatra'
-require 'oauth'
+require 'ims/lti'
 require 'json'
 require 'dm-core'
 require 'dm-migrations'
@@ -44,6 +28,72 @@ configure do
   @@quizlet_config = ExternalConfig.first(:config_type => 'quizlet')
 end
 
+# this is the entry action that Canvas (the LTI Tool Consumer) sends the
+# browser to when launching the tool.
+post "/assessment/start" do
+  # create a ToolProvider object to verify the request
+  @tool_provider = IMS::LTI::ToolProvider.new($oauth_key, $oauth_secret, params)
+  
+  # first we have to verify the oauth signature, to make sure this isn't an
+  # attempt to hack the planet
+  if !@tool_provider.valid_request?(request)
+    return %{unauthorized attempt. make sure you used the consumer secret "#{$oauth_secret}"}
+  end
+
+  # make sure this is an assignment tool launch, not another type of launch.
+  # only assignment tools support the outcome service, since only they appear
+  # in the Canvas gradebook.
+  unless @tool_provider.outcome_service?
+    return %{It looks like this LTI tool wasn't launched as an assignment, or you are trying to take it as a teacher rather than as a a student. Make sure to set up an external tool assignment as outlined <a target="_blank" href="https://github.com/instructure/lti_example">in the README</a> for this example.}
+  end
+
+  # store the relevant parameters from the launch into the user's session, for
+  # access during subsequent http requests.
+  # note that the name and email might be blank, if the tool wasn't configured
+  # in Canvas to provide that private information.
+  session['launch_params'] = @tool_provider.to_params
+
+  # that's it, setup is done. now send them to the assessment!
+  redirect to("/assessment")
+end
+
+get "/assessment" do
+  @tool_provider = IMS::LTI::ToolProvider.new($oauth_key, $oauth_secret, session['launch_params'])
+  # first make sure they got here through a tool launch
+  unless @tool_provider.outcome_service?
+    return %{You need to take this assessment through Canvas.}
+  end
+  @username = @tool_provider.username || "Dude"
+  
+  # now render a simple form the user will submit to "take the quiz"
+  erb :assessment
+end
+
+# This is the action that the form submits to with the score that the student entered.
+# In lieu of a real assessment, that score is then just submitted back to Canvas.
+post "/assessment" do
+  @tool_provider = IMS::LTI::ToolProvider.new($oauth_key, $oauth_secret, session['launch_params'])
+  
+  # obviously in a real tool, we're not going to let the user input their own score
+  score = params['score']
+  if !score || score.empty?
+    redirect to("/assessment")
+  end
+  
+  response = @tool_provider.post_outcome(score)
+
+  headers 'Content-Type' => 'text'
+  <<-TEXT
+  Your score has #{@tool_provider.outcome_post_successful? ? "been posted" : "failed in posting"} to Canvas. The response was:
+  Response code: #{response.code}
+  #{response.body}
+  TEXT
+end
+
+get "/" do
+  erb :index
+end
+
 get "/quizlet_search" do
   return "Quizlet not propertly configured" unless @@quizlet_config
   uri = URI.parse("https://api.quizlet.com/2.0/search/sets")
@@ -53,105 +103,6 @@ get "/quizlet_search" do
   request = Net::HTTP::Get.new(tmp_url)
   response = http.request(request)
   return response.body
-end
-
-# this is the entry action that Canvas (the LTI Tool Consumer) sends the
-# browser to when launching the tool.
-post "/assessment/start" do
-  # first we have to verify the oauth signature, to make sure this isn't an
-  # attempt to hack the planet
-  begin
-    signature = OAuth::Signature.build(request, :consumer_secret => $oauth_secret)
-    signature.verify() or raise OAuth::Unauthorized
-  rescue OAuth::Signature::UnknownSignatureMethod,
-         OAuth::Unauthorized
-    return %{unauthorized attempt. make sure you used the consumer secret "#{$oauth_secret}"}
-  end
-
-  # make sure this is an assignment tool launch, not another type of launch.
-  # only assignment tools support the outcome service, since only they appear
-  # in the Canvas gradebook.
-  unless params['lis_outcome_service_url'] && params['lis_result_sourcedid']
-    return %{It looks like this LTI tool wasn't launched as an assignment, or you are trying to take it as a teacher rather than as a a student. Make sure to set up an external tool assignment as outlined <a target="_blank" href="https://github.com/instructure/lti_example">in the README</a> for this example.}
-  end
-
-  # store the relevant parameters from the launch into the user's session, for
-  # access during subsequent http requests.
-  # note that the name and email might be blank, if the tool wasn't configured
-  # in Canvas to provide that private information.
-  %w(lis_outcome_service_url lis_result_sourcedid lis_person_name_full lis_person_contact_email_primary).each { |v| session[v] = params[v] }
-
-  # that's it, setup is done. now send them to the assessment!
-  redirect to("/assessment")
-end
-
-def username
-  session['lis_person_name_full'] || 'Student'
-end
-
-get "/assessment" do
-  # first make sure they got here through a tool launch
-  unless session['lis_result_sourcedid']
-    return %{You need to take this assessment through Canvas.}
-  end
-  @username = username
-  
-  # now render a simple form the user will submit to "take the quiz"
-  erb :assessment
-end
-
-# This is the action that the form submits to with the score that the student entered.
-# In lieu of a real assessment, that score is then just submitted back to Canvas.
-post "/assessment" do
-  # obviously in a real tool, we're not going to let the user input their own score
-  score = params['score']
-  if !score || score.empty?
-    redirect to("/assessment")
-  end
-
-  # now post the score to canvas. Make sure to sign the POST correctly with
-  # OAuth 1.0, including the digest of the XML body. Also make sure to set the
-  # content-type to application/xml.
-  xml = %{
-<?xml version = "1.0" encoding = "UTF-8"?>
-<imsx_POXEnvelopeRequest xmlns = "http://www.imsglobal.org/lis/oms1p0/pox">
-  <imsx_POXHeader>
-    <imsx_POXRequestHeaderInfo>
-      <imsx_version>V1.0</imsx_version>
-      <imsx_messageIdentifier>12341234</imsx_messageIdentifier>
-    </imsx_POXRequestHeaderInfo>
-  </imsx_POXHeader>
-  <imsx_POXBody>
-    <replaceResultRequest>
-      <resultRecord>
-        <sourcedGUID>
-          <sourcedId>#{session['lis_result_sourcedid']}</sourcedId>
-        </sourcedGUID>
-        <result>
-          <resultScore>
-            <language>en</language>
-            <textString>#{score}</textString>
-          </resultScore>
-        </result>
-      </resultRecord>
-    </replaceResultRequest>
-  </imsx_POXBody>
-</imsx_POXEnvelopeRequest>
-  }
-  consumer = OAuth::Consumer.new($oauth_key, $oauth_secret)
-  token = OAuth::AccessToken.new(consumer)
-  response = token.post(session['lis_outcome_service_url'], xml, 'Content-Type' => 'application/xml')
-
-  headers 'Content-Type' => 'text'
-  %{
-Your score has #{response.body.match(/\bsuccess\b/) ? "been posted" : "failed in posting"} to Canvas. The response was:
-
-#{response.body}
-  }
-end
-
-get "/" do
-  erb :index
 end
 
 def config_wrap(xml)
